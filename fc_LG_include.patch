@@ -1,0 +1,139 @@
+diff -urN linux-4.19.127/include/linux/netdevice.h new_scone/include/linux/netdevice.h
+--- linux-4.19.127/include/linux/netdevice.h	2020-06-07 20:17:57.000000000 +0900
++++ new_scone/include/linux/netdevice.h	2021-12-14 18:29:01.456271132 +0900
+@@ -69,6 +69,19 @@
+ struct bpf_prog;
+ struct xdp_buff;
+ 
++#ifdef SIMPLE_PATH
++extern struct iphdr *iph;
++int netif_simple_path(struct sk_buff *skb);
++int netif_simple_netfilter(u_int8_t pf, unsigned int hook,
++				 struct sk_buff *skb);
++int pre_routing_netfilter(struct sk_buff* skb);
++int forward_netfilter(struct sk_buff* skb);
++int post_routing_netfilter(struct sk_buff* skb);
++struct neighbour* get_neighbour(struct sk_buff* skb, struct net_device *dev);
++int netif_simple_route(struct sk_buff* skb, struct iphdr *iph);
++int netif_simple_forward(struct sk_buff* skb, struct iphdr *iph);
++#endif
++
+ void netdev_set_default_ethtool_ops(struct net_device *dev,
+ 				    const struct ethtool_ops *ops);
+ 
+@@ -2032,6 +2045,11 @@
+ 	struct lock_class_key	*qdisc_running_key;
+ 	bool			proto_down;
+ 	unsigned		wol_enabled:1;
++
++	#ifdef FCRACKER
++		struct scone_flow_table *ft;
++		struct list_head ctable_list;
++	#endif
+ };
+ #define to_net_dev(d) container_of(d, struct net_device, dev)
+ 
+diff -urN linux-4.19.127/include/linux/scone.h new_scone/include/linux/scone.h
+--- linux-4.19.127/include/linux/scone.h	1970-01-01 09:00:00.000000000 +0900
++++ new_scone/include/linux/scone.h	2022-01-03 16:15:21.196639188 +0900
+@@ -0,0 +1,53 @@
++#ifndef __SCONE_H
++#define __SCONE_H
++
++#define FCRACKER
++#ifdef FCRACKER
++	#define FLOW_TABLE
++	#define MULTI_FT
++	#define SIMPLE_PATH
++#endif
++
++#ifdef FLOW_TABLE
++	#define DST_PASS
++#endif
++
++#ifdef SIMPLE_PATH
++    #ifndef SKIP_QOS
++        #define SKIP_QOS
++    #endif
++#endif
++
++struct scone_flow_table {
++#ifdef MULTI_FT
++        struct list_head ctable_list;
++#endif
++        unsigned long _skb_refdst;
++#ifdef DST_PASS
++        int			(*input)(struct sk_buff *);
++        struct net_device *out_dev;
++        int                 out_mtu;
++#endif
++        __be32 saddr;
++        __be32 daddr;
++        __u8 ip_protocol;
++        struct neighbour * neigh;
++        int netfilter;
++        struct net_device	*dev;
++        int	xmit_simple;
++	int     count;
++} ____cacheline_internodealigned_in_smp;
++
++struct scone_flow_table* scone_init(struct sk_buff *skb);
++#ifndef MULTI_FT
++int find_ft(struct sk_buff *skb, struct scone_flow_table *ft);
++#else
++int find_ft(struct sk_buff *skb, struct scone_flow_table *ft, struct list_head *head);
++#endif
++/* scone netfilter */
++int scone_simple_netfilter(struct sk_buff *skb);
++#ifdef FLOW_TABLE
++void probe_ft(struct sk_buff *skb);
++#endif
++void print_iph(struct sk_buff *skb);
++#endif
+diff -urN linux-4.19.127/include/linux/skbuff.h new_scone/include/linux/skbuff.h
+--- linux-4.19.127/include/linux/skbuff.h	2020-06-07 20:17:57.000000000 +0900
++++ new_scone/include/linux/skbuff.h	2021-12-14 18:29:01.492270457 +0900
+@@ -40,7 +40,7 @@
+ #include <linux/in6.h>
+ #include <linux/if_packet.h>
+ #include <net/flow.h>
+-
++#include <linux/scone.h>	//kwlee
+ /* The interface for checksum offload between the stack and networking drivers
+  * is as follows...
+  *
+@@ -587,7 +587,7 @@
+ typedef unsigned char *sk_buff_data_t;
+ #endif
+ 
+-/** 
++/**
+  *	struct sk_buff - socket buffer
+  *	@next: Next buffer in list
+  *	@prev: Previous buffer in list
+@@ -726,6 +726,16 @@
+ 	 */
+ 	__u16			queue_mapping;
+ 
++#ifdef FLOW_TABLE
++	struct scone_flow_table	*ft;
++#ifdef DST_PASS
++	int 		(*input)(struct sk_buff *);
++	struct net_device	*out_dev;
++#endif
++	struct neighbour	*neigh;
++	int netfilter;
++#endif
++
+ /* if you move cloned around you also must adapt those constants */
+ #ifdef __BIG_ENDIAN_BITFIELD
+ #define CLONED_MASK	(1 << 7)
+@@ -889,7 +899,7 @@
+  */
+ static inline struct dst_entry *skb_dst(const struct sk_buff *skb)
+ {
+-	/* If refdst was not refcounted, check we still are in a 
++	/* If refdst was not refcounted, check we still are in a
+ 	 * rcu_read_lock section
+ 	 */
+ 	WARN_ON((skb->_skb_refdst & SKB_DST_NOREF) &&

@@ -1,0 +1,1114 @@
+diff -urN linux-4.19.127/net/bluetooth/hci_conn.c /mnt/firecracker/new_scone/net/bluetooth/hci_conn.c
+--- linux-4.19.127/net/bluetooth/hci_conn.c	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/bluetooth/hci_conn.c	2021-12-14 18:29:01.724266104 +0900
+@@ -1282,8 +1282,13 @@
+ 			return 0;
+ 	}
+ 
+-	if (hci_conn_ssp_enabled(conn) &&
+-	    !test_bit(HCI_CONN_ENCRYPT, &conn->flags))
++	/* If Secure Simple Pairing is not enabled, then legacy connection
++	 * setup is used and no encryption or key sizes can be enforced.
++	 */
++	if (!hci_conn_ssp_enabled(conn))
++		return 1;
++
++	if (!test_bit(HCI_CONN_ENCRYPT, &conn->flags))
+ 		return 0;
+ 
+ 	return 1;
+diff -urN linux-4.19.127/net/bridge/br_if.c /mnt/firecracker/new_scone/net/bridge/br_if.c
+--- linux-4.19.127/net/bridge/br_if.c	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/bridge/br_if.c	2021-12-14 18:29:01.728266028 +0900
+@@ -430,6 +430,12 @@
+ 	p->path_cost = port_cost(dev);
+ 	p->priority = 0x8000 >> BR_PORT_BITS;
+ 	p->port_no = index;
++#ifdef FLOW_TABLE
++	p->ft=NULL;
++#ifdef MULTI_FT
++	INIT_LIST_HEAD(&p->ctable_list);
++#endif
++#endif
+ 	p->flags = BR_LEARNING | BR_FLOOD | BR_MCAST_FLOOD | BR_BCAST_FLOOD;
+ 	br_init_port(p);
+ 	br_set_state(p, BR_STATE_DISABLED);
+diff -urN linux-4.19.127/net/bridge/br_input.c /mnt/firecracker/new_scone/net/bridge/br_input.c
+--- linux-4.19.127/net/bridge/br_input.c	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/bridge/br_input.c	2021-12-30 15:33:20.249590480 +0900
+@@ -22,16 +22,28 @@
+ #include <linux/rculist.h>
+ #include "br_private.h"
+ #include "br_private_tunnel.h"
++//kwlee
++#include <linux/ip.h>
++#include <net/ip.h>
+ 
+ /* Hook for brouter */
+ br_should_route_hook_t __rcu *br_should_route_hook __read_mostly;
+ EXPORT_SYMBOL(br_should_route_hook);
+ 
+ static int
+-br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
+-{
++br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb){
++
+ 	br_drop_fake_rtable(skb);
++
++#ifndef SIMPLE_PATH
+ 	return netif_receive_skb(skb);
++#else
++	if(skb->ft != NULL && skb->ft->xmit_simple == 1){
++		return netif_simple_path(skb);
++	}
++	else
++		return netif_receive_skb(skb);
++#endif
+ }
+ 
+ static int br_pass_frame_up(struct sk_buff *skb)
+@@ -306,6 +318,7 @@
+ 		NF_HOOK(NFPROTO_BRIDGE, NF_BR_PRE_ROUTING,
+ 			dev_net(skb->dev), NULL, skb, skb->dev, NULL,
+ 			br_handle_frame_finish);
++
+ 		break;
+ 	default:
+ drop:
+diff -urN linux-4.19.127/net/bridge/br_private.h /mnt/firecracker/new_scone/net/bridge/br_private.h
+--- linux-4.19.127/net/bridge/br_private.h	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/bridge/br_private.h	2021-12-14 18:29:01.732265953 +0900
+@@ -22,6 +22,7 @@
+ #include <linux/if_vlan.h>
+ #include <linux/rhashtable.h>
+ #include <linux/refcount.h>
++#include <linux/scone.h>
+ 
+ #define BR_HASH_BITS 8
+ #define BR_HASH_SIZE (1 << BR_HASH_BITS)
+@@ -258,7 +259,12 @@
+ 	struct timer_list		message_age_timer;
+ 	struct kobject			kobj;
+ 	struct rcu_head			rcu;
+-
++#ifdef FLOW_TABLE
++	struct scone_flow_table *ft;
++#ifdef MULTI_FT
++	struct list_head ctable_list;
++#endif
++#endif
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+ 	struct bridge_mcast_own_query	ip4_own_query;
+ #if IS_ENABLED(CONFIG_IPV6)
+diff -urN linux-4.19.127/net/bridge/Makefile /mnt/firecracker/new_scone/net/bridge/Makefile
+--- linux-4.19.127/net/bridge/Makefile	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/bridge/Makefile	2021-12-14 18:29:01.728266028 +0900
+@@ -8,7 +8,7 @@
+ bridge-y	:= br.o br_device.o br_fdb.o br_forward.o br_if.o br_input.o \
+ 			br_ioctl.o br_stp.o br_stp_bpdu.o \
+ 			br_stp_if.o br_stp_timer.o br_netlink.o \
+-			br_netlink_tunnel.o br_arp_nd_proxy.o
++			br_netlink_tunnel.o br_arp_nd_proxy.o scone.o
+ 
+ bridge-$(CONFIG_SYSFS) += br_sysfs_if.o br_sysfs_br.o
+ 
+diff -urN linux-4.19.127/net/bridge/scone.c /mnt/firecracker/new_scone/net/bridge/scone.c
+--- linux-4.19.127/net/bridge/scone.c	1970-01-01 09:00:00.000000000 +0900
++++ /mnt/firecracker/new_scone/net/bridge/scone.c	2022-01-03 16:16:22.223698688 +0900
+@@ -0,0 +1,324 @@
++#include <linux/uaccess.h>
++#include <linux/bitops.h>
++#include <linux/capability.h>
++#include <linux/cpu.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/hash.h>
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include <linux/sched/mm.h>
++#include <linux/mutex.h>
++#include <linux/string.h>
++#include <linux/mm.h>
++#include <linux/socket.h>
++#include <linux/sockios.h>
++#include <linux/errno.h>
++#include <linux/interrupt.h>
++#include <linux/if_ether.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/ethtool.h>
++#include <linux/skbuff.h>
++#include <linux/bpf.h>
++#include <linux/bpf_trace.h>
++#include <net/net_namespace.h>
++#include <net/sock.h>
++#include <net/busy_poll.h>
++#include <linux/rtnetlink.h>
++#include <linux/stat.h>
++#include <net/dst.h>
++#include <net/dst_metadata.h>
++#include <net/pkt_sched.h>
++#include <net/pkt_cls.h>
++#include <net/checksum.h>
++#include <net/xfrm.h>
++#include <linux/highmem.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/netpoll.h>
++#include <linux/rcupdate.h>
++#include <linux/delay.h>
++#include <net/iw_handler.h>
++#include <asm/current.h>
++#include <linux/audit.h>
++#include <linux/dmaengine.h>
++#include <linux/err.h>
++#include <linux/ctype.h>
++#include <linux/if_arp.h>
++#include <linux/if_vlan.h>
++#include <linux/ip.h>
++#include <net/ip.h>
++#include <net/mpls.h>
++#include <linux/ipv6.h>
++#include <linux/in.h>
++#include <linux/jhash.h>
++#include <linux/random.h>
++#include <trace/events/napi.h>
++#include <trace/events/net.h>
++#include <trace/events/skb.h>
++#include <linux/pci.h>
++#include <linux/inetdevice.h>
++#include <linux/cpu_rmap.h>
++#include <linux/static_key.h>
++#include <linux/hashtable.h>
++#include <linux/vmalloc.h>
++#include <linux/if_macvlan.h>
++#include <linux/errqueue.h>
++#include <linux/hrtimer.h>
++#include <linux/netfilter_ingress.h>
++#include <linux/crash_dump.h>
++#include <linux/sctp.h>
++#include <net/udp_tunnel.h>
++#include <linux/net_namespace.h>
++#include <net/arp.h>
++#include <net/icmp.h>
++#include <linux/uaccess.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <linux/highmem.h>
++#include <linux/slab.h>
++
++#include <linux/socket.h>
++#include <linux/sockios.h>
++#include <linux/in.h>
++#include <linux/inet.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/proc_fs.h>
++#include <linux/stat.h>
++#include <linux/init.h>
++
++#include <net/snmp.h>
++#include <net/ip.h>
++#include <net/protocol.h>
++#include <net/route.h>
++#include <net/xfrm.h>
++#include <linux/skbuff.h>
++#include <net/sock.h>
++#include <net/arp.h>
++#include <net/icmp.h>
++#include <net/checksum.h>
++#include <net/inetpeer.h>
++#include <net/lwtunnel.h>
++#include <linux/bpf-cgroup.h>
++#include <linux/igmp.h>
++#include <linux/netlink.h>
++#include <linux/tcp.h>
++
++#include "br_private.h"
++#include <linux/scone.h>
++
++void print_iph(struct sk_buff *skb){
++  struct iphdr *iph = ip_hdr(skb);
++
++  unsigned long saddr = ntohl( iph->saddr );
++  unsigned long daddr = ntohl( iph->daddr );
++
++  printk("SCON: [%s] daddr:%lu.%lu.%lu.%lu, saddr:%lu.%lu.%lu.%lu, tos:%d, smp_processor_id:%d\n", __func__,
++  				(daddr & 0xFF000000) >> 24, (daddr & 0x00FF0000) >> 16, (daddr & 0x0000FF00) >> 8, (daddr & 0x000000FF),
++  				(saddr & 0xFF000000) >> 24, (saddr & 0x00FF0000) >> 16, (saddr & 0x0000FF00) >> 8, (saddr & 0x000000FF),
++  				(int) iph->tos, smp_processor_id());
++
++}
++#ifdef FLOW_TABLE
++struct scone_flow_table* scone_init(struct sk_buff *skb)
++{
++  struct iphdr *iph;
++  struct scone_flow_table *ft = NULL;
++  int err = 0;
++
++  ft = kzalloc(sizeof(struct scone_flow_table), GFP_KERNEL);
++  if(ft == NULL){
++    printk("SCON: [%s] Failed to allocate flow table memory \n", __func__);
++    return NULL;
++  }
++
++  ft = memset(ft, 0, sizeof(struct scone_flow_table));
++  if (ft == NULL){
++    printk("SCON: [%s] Memset Failed \n", __func__);
++    return NULL;
++  }
++
++#ifndef FCRACKER
++  skb_reset_network_header(skb);
++#else
++  skb_reset_network_header(skb);
++  if (!skb_transport_header_was_set(skb))
++    skb_reset_transport_header(skb);
++  skb_reset_mac_len(skb);
++#endif
++
++  iph = ip_hdr(skb);
++  if (iph == NULL) {
++    printk("SCON: [%s] failed to get ip header information\n", __func__);
++    return NULL;
++  }
++
++  ft->ip_protocol = iph->protocol;
++  ft->saddr = iph->saddr;
++  ft->daddr = iph->daddr;
++	ft->netfilter = 0;
++	ft->count = 0;
++	ft->xmit_simple = 0;
++
++#ifdef MULTI_FT
++	INIT_LIST_HEAD(&ft->ctable_list);
++#endif
++  printk("SCON: [%s] ft = %p, daddr = %d\n", __func__, ft, iph->daddr);
++  return ft;
++}
++EXPORT_SYMBOL(scone_init);
++
++#ifndef MULTI_FT
++int find_ft(struct sk_buff *skb, struct scone_flow_table *ft)
++#else
++int find_ft(struct sk_buff *skb, struct scone_flow_table *ft, struct list_head *head)
++#endif
++{
++	struct iphdr *iph;
++  int err = 0;
++	struct scone_flow_table *new_ft;
++
++#ifndef FCRACKER
++  skb_reset_network_header(skb);
++#else
++  skb_reset_network_header(skb);
++  if (!skb_transport_header_was_set(skb))
++    skb_reset_transport_header(skb);
++  skb_reset_mac_len(skb);
++#endif
++  if (skb == NULL || ft == NULL){
++    printk("SCON: [%s] skb (%p)or ft (%p) is NULL\n", __func__, skb, ft);
++    return err;
++}
++	iph = ip_hdr(skb);
++
++	if (iph == NULL) {
++		printk("SCON: [%s] Failed to get ip header information, skb->protocol=%d\n", __func__, skb->protocol);
++    return err;
++  }
++
++	if (iph->protocol == ft->ip_protocol && iph->saddr == ft->saddr && iph->daddr == ft->daddr)
++			skb->ft = ft;
++#ifndef MULTI_FT
++	else{
++    new_ft = memset(ft, 0, sizeof(struct scone_flow_table));
++		if (new_ft == NULL ) {
++	    printk("SCON: [%s] memset Failed \n", __func__);
++			return err;
++	   }
++	 	ft->ip_protocol = iph->protocol;
++	  ft->saddr = iph->saddr;
++		ft->daddr = iph->daddr;
++		ft->netfilter = 0;
++	}
++#else
++	else{
++		skb->ft=NULL;
++		list_for_each_entry(new_ft, head, ctable_list){
++			if (iph->protocol == new_ft->ip_protocol && iph->saddr == new_ft->saddr && iph->daddr == new_ft->daddr){
++        skb->ft = new_ft;
++				printk("SCON: [%s] find the right ft %ld\n", __func__, new_ft->_skb_refdst);
++			}
++		}
++		if(skb->ft == NULL){
++			new_ft=scone_init(skb);
++			if(new_ft==NULL){
++				printk("SCON: [%s] failed to allocation new ft %p\n", __func__, new_ft);
++				return err;
++			}
++			else
++        list_add(&new_ft->ctable_list, head);
++			skb->ft = new_ft;
++		}
++	}
++#endif
++  return 1;
++}
++EXPORT_SYMBOL(find_ft);
++
++void probe_ft(struct sk_buff *skb)
++{
++  int err;
++#ifndef FCRACKER
++  struct net_bridge_port *p = br_port_get_rcu(skb->dev);
++#else
++  struct net_device *p = skb->dev;
++  struct iphdr *iph;
++#endif
++#ifdef MULTI_FT
++	struct scone_flow_table *ft;
++#endif
++
++#ifndef FCRACKER
++  if(skb==NULL)
++    return;
++  printk("SCON: [%s] dev = %s\n", __func__, p->dev->name);
++#else
++  if(skb==NULL || p==NULL){
++    printk("SCON: skb (%p) or p (%p) is NULL \n", skb, p);
++    return;
++  }
++
++#endif
++
++#ifdef FCRACKER
++  skb_reset_network_header(skb);
++  if (!skb_transport_header_was_set(skb))
++    skb_reset_transport_header(skb);
++  skb_reset_mac_len(skb);
++
++  iph = ip_hdr(skb);
++  if(iph == NULL || iph->daddr == 0 || iph->saddr == 0)
++    return;
++  if(iph->daddr != 33619978)
++    return;
++#endif
++
++#ifndef MULTI_FT
++  if(p->ft == NULL){
++    p->ft = scone_init(skb);
++#else
++  if(list_empty(&p->ctable_list)){
++    p->ft = scone_init(skb);
++    if(p->ft == NULL)
++      return;
++    else
++      list_add(&p->ft->ctable_list, &p->ctable_list);
++#endif
++    skb->ft = p->ft;
++  } else {
++#ifndef MULTI_FT
++      err = find_ft(skb, p->ft);
++#else
++      err = find_ft(skb, p->ft, &p->ctable_list);
++      p->ft = skb->ft;
++#endif
++  }
++  if(err==0){
++    printk(KERN_EMERG "SCON: find_ft has error\n");
++    return;
++  }
++
++#ifdef MULTI_FT
++  ft = skb->ft;
++  if (ft->_skb_refdst != 0)
++    skb->_skb_refdst = ft->_skb_refdst;
++
++#ifdef DST_PASS
++  skb->out_dev = ft->out_dev;
++  skb->input = ft->input;
++#endif
++  skb->neigh = ft->neigh;
++  skb->netfilter = ft->netfilter;
++#endif
++
++}
++EXPORT_SYMBOL(probe_ft);
++
++#endif /* FLOW_TABLE */
+diff -urN linux-4.19.127/net/core/dev.c /mnt/firecracker/new_scone/net/core/dev.c
+--- linux-4.19.127/net/core/dev.c	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/core/dev.c	2021-12-15 18:11:45.924097419 +0900
+@@ -147,6 +147,11 @@
+ #include <linux/net_namespace.h>
+ 
+ #include "net-sysfs.h"
++//for New_SCON
++#include <linux/scone.h>
++#include <net/icmp.h>
++#include <linux/netfilter.h>
++#include <net/arp.h>
+ 
+ #define MAX_GRO_SKBS 8
+ #define MAX_NEST_DEV 8
+@@ -3741,6 +3746,41 @@
+ 	return netdev_get_tx_queue(dev, queue_index);
+ }
+ 
++static int __dev_queue_xmit_simple(struct sk_buff *skb, void *accel_priv)
++{
++	struct net_device *dev;
++	const struct net_device_ops *ops;
++	int rc = -ENOMEM;
++#ifdef FCRACKER
++	struct netdev_queue *txq;
++	struct ethhdr *mh = eth_hdr(skb);
++#endif
++
++	if(skb==NULL || skb->dev==NULL){
++		printk("SCON: xmit simple drop\n");
++		goto drop;
++	}
++	skb_reset_network_header(skb);
++
++	dev = skb->dev;
++	ops = dev->netdev_ops;
++
++	skb->queue_mapping = smp_processor_id();
++
++	rc = ops->ndo_start_xmit(skb, dev);
++
++	if (dev_xmit_complete(rc)){
++		goto out;
++	}
++
++drop:	rc = -ENETDOWN;
++	atomic_long_inc(&dev->tx_dropped);
++	kfree_skb(skb);
++	return rc;
++out:
++	return rc;
++}
++
+ /**
+  *	__dev_queue_xmit - transmit a buffer
+  *	@skb: buffer to transmit
+@@ -3810,11 +3850,12 @@
+ 	q = rcu_dereference_bh(txq->qdisc);
+ 
+ 	trace_net_dev_queue(skb);
++#ifndef SKIP_QOS
+ 	if (q->enqueue) {
+ 		rc = __dev_xmit_skb(skb, q, dev, txq);
+ 		goto out;
+ 	}
+-
++#endif
+ 	/* The device has no queue. Common case for software devices:
+ 	 * loopback, all the sorts of tunnels...
+ 
+@@ -3876,7 +3917,14 @@
+ 
+ int dev_queue_xmit(struct sk_buff *skb)
+ {
+-	return __dev_queue_xmit(skb, NULL);
++#ifdef SIMPLE_PATH
++//	if(skb->ft == NULL)
++		return __dev_queue_xmit(skb, NULL);
++//	else if(skb->ft->xmit_simple == 1)
++//		return __dev_queue_xmit_simple(skb, NULL);
++#else
++		return __dev_queue_xmit(skb, NULL);
++#endif
+ }
+ EXPORT_SYMBOL(dev_queue_xmit);
+ 
+@@ -4956,6 +5004,7 @@
+ 	int ret;
+ 
+ 	ret = __netif_receive_skb_core(&skb, pfmemalloc, &pt_prev);
++
+ 	if (pt_prev)
+ 		ret = pt_prev->func(skb, skb->dev, pt_prev, orig_dev);
+ 	return ret;
+@@ -5049,6 +5098,285 @@
+ 	__netif_receive_skb_list_ptype(&sublist, pt_curr, od_curr);
+ }
+ 
++#ifdef SIMPLE_PATH
++extern struct neighbour *__ipv4_neigh_lookup_noref_proxy(struct net_device *dev, u32 key);
++extern struct neigh_table arp_tbl;
++
++int netif_simple_netfilter(u_int8_t pf, unsigned int hook,
++				 struct sk_buff *skb) {
++
++    return nf_hook(pf, hook, sock_net(skb->sk), skb->sk, skb, NULL, skb_dst(skb)->dev, NULL);
++}
++
++int pre_routing_netfilter(struct sk_buff* skb) {
++    int ret;
++#ifdef FLOW_TABLE
++    if (skb->netfilter == 0) {
++        if ((ret = netif_simple_netfilter(NFPROTO_IPV4, NF_INET_PRE_ROUTING, skb)) != 1) {
++            if (skb->ft != NULL)
++                skb->ft->netfilter = 0;
++            dev_kfree_skb(skb);
++            return NET_RX_DROP;
++        }
++    } else return NET_RX_SUCCESS;
++#else
++    if ((ret = netif_simple_netfilter(NFPROTO_IPV4, NF_INET_PRE_ROUTING, skb)) != 1) {
++        dev_kfree_skb(skb);
++        return NET_RX_DROP;
++    }
++#endif
++}
++
++int forward_netfilter(struct sk_buff* skb) {
++    int ret;
++#ifdef FLOW_TABLE
++    if (skb->netfilter == 0) {
++        if ((ret = netif_simple_netfilter(NFPROTO_IPV4, NF_INET_FORWARD, skb)) != 1) {
++            if (skb->ft != NULL)
++                skb->ft->netfilter = 0;
++            dev_kfree_skb(skb);
++            return NET_RX_DROP;
++        }
++    } else return NET_RX_SUCCESS;
++#else
++    if ((ret = netif_simple_netfilter(NFPROTO_IPV4, NF_INET_FORWARD, skb)) != 1) {
++        dev_kfree_skb(skb);
++        return NET_RX_DROP;
++    }
++#endif
++
++}
++
++int post_routing_netfilter(struct sk_buff* skb) {
++    int ret;
++#ifdef FLOW_TABLE
++    if (skb->netfilter == 0) {
++        if ((ret = netif_simple_netfilter(NFPROTO_IPV4, NF_INET_POST_ROUTING, skb)) != 1) {
++            if (skb->ft != NULL)
++                skb->ft->netfilter = 0;
++            dev_kfree_skb(skb);
++            return NET_RX_DROP;
++        } else {
++            skb->ft->netfilter = 1;
++            return NET_RX_SUCCESS;
++        }
++    } else return NET_RX_SUCCESS;
++#else
++    if ((ret = netif_simple_netfilter(NFPROTO_IPV4, NF_INET_POST_ROUTING, skb)) != 1) {
++        dev_kfree_skb(skb);
++        return NET_RX_DROP;
++    }
++#endif
++
++}
++
++struct neighbour* get_neighbour(struct sk_buff* skb, struct net_device *dev) {
++    struct neighbour *neigh;
++    u32 nexthop;
++
++#ifndef DST_PASS
++    struct dst_entry *dst = skb_dst(skb);
++    struct rtable *rt = (struct rtable *)dst;
++#endif
++
++#ifdef FLOW_TABLE
++    if (skb->ft == NULL) {
++#ifdef DST_PASS
++        struct dst_entry *dst = skb_dst(skb);
++        struct rtable *rt = (struct rtable *)dst;
++#endif
++        nexthop = (__force u32) rt_nexthop(rt, ip_hdr(skb)->daddr);
++        neigh = __ipv4_neigh_lookup_noref(dev, nexthop);
++    } else if (skb->neigh == NULL) {
++#ifdef DST_PASS
++        struct dst_entry *dst = skb_dst(skb);
++        struct rtable *rt = (struct rtable *)dst;
++#endif
++				nexthop = (__force u32) rt_nexthop(rt, ip_hdr(skb)->daddr);
++				neigh = __ipv4_neigh_lookup_noref(dev, nexthop);
++        skb->ft->neigh = neigh;
++    } else {
++        neigh = skb->neigh;
++    }
++#else
++		nexthop = (__force u32) rt_nexthop(rt, ip_hdr(skb)->daddr);
++		neigh = __ipv4_neigh_lookup_noref(dev, nexthop);
++#endif
++
++    if (unlikely(!neigh))
++            neigh = __neigh_create(&arp_tbl, &nexthop, skb->dev, false);
++
++    return neigh;
++
++}
++
++int netif_simple_route(struct sk_buff* skb, struct iphdr *iph) {
++#ifndef DST_PASS
++    if (!skb_dst(skb)) {
++#else
++    if (skb->ft->_skb_refdst == 0) {
++#endif
++            int err = ip_route_input_noref(skb, iph->daddr, iph->saddr,
++                                           iph->tos, skb->dev);
++
++            if (unlikely(err)) {
++                    unsigned long saddr = ntohl( iph->saddr );
++                    unsigned long daddr = ntohl( iph->daddr );
++
++                    printk("unlikely(err) occurred, err:%d, daddr:%lu.%lu.%lu.%lu, saddr:%lu.%lu.%lu.%lu, tos:%d, dev:%p, smp_processor_id:%d\n",
++                       err, (daddr & 0xFF000000) >> 24, (daddr & 0x00FF0000) >> 16, (daddr & 0x0000FF00) >> 8, (daddr & 0x000000FF),
++                       (saddr & 0xFF000000) >> 24, (saddr & 0x00FF0000) >> 16, (saddr & 0x0000FF00) >> 8, (saddr & 0x000000FF),
++                       (int) iph->tos, skb->dev, smp_processor_id());
++
++                    if (err == -EXDEV)
++                            NET_INC_STATS(dev_net(skb->dev),
++                                             LINUX_MIB_IPRPFILTER);
++                    dev_kfree_skb(skb);
++                    return NET_RX_DROP;
++            }
++
++#ifdef FLOW_TABLE
++            skb->ft->_skb_refdst = skb->_skb_refdst;
++#ifdef DST_PASS
++            skb->ft->input = skb_dst(skb)->input;
++            skb->ft->out_dev = skb_dst(skb)->dev;
++            skb->input = skb->ft->input;
++            skb->out_dev = skb->ft->out_dev;
++#endif
++#endif
++    }
++
++    return NET_RX_SUCCESS;
++}
++
++int netif_simple_forward(struct sk_buff* skb, struct iphdr *iph){
++	int ret;
++	struct neighbour *neigh;
++
++	#ifndef DST_PASS
++	  struct net_device *dev = skb_dst(skb)->dev;
++	#else
++	  struct net_device *dev = skb->out_dev;
++	#endif
++
++	if(iph==NULL || ip_hdr(skb)==NULL){
++		printk("SCON: [%s] - ip header is NULL\n", __func__);
++		goto drop;
++	}
++
++//  if (ip_hdr(skb)->ttl <= 1)
++//		goto too_many_hops;
++
++//  ip_decrease_ttl(iph);
++
++//        ret = forward_netfilter(skb);
++//        if (ret == NET_RX_DROP)
++//            return NET_RX_DROP;
++
++  skb->dev = dev;
++  skb->protocol = htons(ETH_P_IP);
++
++//        ret = post_routing_netfilter(skb);
++//        if (ret == NET_RX_DROP)
++//            return NET_RX_DROP;
++
++	ret = scone_simple_netfilter(skb);
++	if(ret!=NF_ACCEPT){
++		printk("SCON: scone simple netfilter has errors\n");
++		goto drop;
++	}
++
++/*
++#ifndef DST_PASS
++    if (skb->len > min(skb_dst(skb)->dev->mtu, IP_MAX_MTU))
++#else
++    if (skb->ft->out_mtu == 0)
++        skb->ft->out_mtu = dev->mtu;
++
++    if (skb->len > skb->ft->out_mtu)
++#endif
++			return ip_fragment(sock_net(skb->sk), skb->sk, skb, dev->mtu, ip_finish_output2);
++*/
++
++  neigh = get_neighbour(skb, dev);
++
++	if (!IS_ERR(neigh))
++		neigh_output(neigh, skb);
++  else
++    goto drop;
++
++  return NET_RX_SUCCESS;
++
++too_many_hops:
++	/* Tell the sender its packet died... */
++	IP_INC_STATS(dev_net(skb_dst(skb)->dev), IPSTATS_MIB_INHDRERRORS);
++  printk("too many hops \n");
++	icmp_send(skb, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
++
++drop:
++	kfree_skb(skb);
++	printk("SCON: [%s] Packet Drop at last\n", __func__);
++	return NET_RX_DROP;
++
++}
++
++int netif_simple_path(struct sk_buff* skb) {
++	struct iphdr *iph;
++	int ret;
++
++	if(skb == NULL || skb->ft == NULL){
++		printk("SCON: [%s] skb or skb->ft is NULL\n", __func__);
++		goto drop;
++	}
++
++	skb_reset_network_header(skb);
++	if (!skb_transport_header_was_set(skb))
++		skb_reset_transport_header(skb);
++	skb_reset_mac_len(skb);
++
++  iph = ip_hdr(skb);
++
++/*	unsigned long saddr = ntohl( iph->saddr );
++  unsigned long daddr = ntohl( iph->daddr );
++  printk("simple_path: daddr:%lu.%lu.%lu.%lu, saddr:%lu.%lu.%lu.%lu, tos:%d, smp_processor_id:%d\n",
++  				(daddr & 0xFF000000) >> 24, (daddr & 0x00FF0000) >> 16, (daddr & 0x0000FF00) >> 8, (daddr & 0x000000FF),
++  				(saddr & 0xFF000000) >> 24, (saddr & 0x00FF0000) >> 16, (saddr & 0x0000FF00) >> 8, (saddr & 0x000000FF),
++  				(int) iph->tos, smp_processor_id());*/
++
++/*    ret = pre_routing_netfilter(skb);
++    if (ret == NET_RX_DROP){
++			printk("SCON: [%s] Packet Drop in pre_routing_netfilter\n", __func__);
++      return ret;
++			}
++*/
++    ret = netif_simple_route(skb, iph);
++    if (ret == NET_RX_DROP){
++			printk("SCON: [%s] Packet Drop in netif_simple_route\n", __func__);
++      return ret;
++		}
++#ifndef DST_PASS
++    if (skb_dst(skb) == NULL || skb_dst(skb)->input == NULL) {
++        printk("skb_dst(skb) == NULL, cpu_id:%d\n", smp_processor_id());
++        goto drop;
++    }
++#endif
++
++    ret = netif_simple_forward(skb, iph);
++    if (ret == NET_RX_DROP){
++			printk("SCON: [%s] Packet Drop in netif_simple_forward\n", __func__);
++      return ret;
++		}
++    return NET_RX_SUCCESS;
++
++drop:
++	dev_kfree_skb(skb);
++	printk("SCON: [%s] Packet Drop at last\n", __func__);
++	return NET_RX_DROP;
++
++}
++EXPORT_SYMBOL(netif_simple_path);
++#endif
++
+ static int __netif_receive_skb(struct sk_buff *skb)
+ {
+ 	int ret;
+diff -urN linux-4.19.127/net/core/skbuff.c /mnt/firecracker/new_scone/net/core/skbuff.c
+--- linux-4.19.127/net/core/skbuff.c	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/core/skbuff.c	2021-12-14 18:29:01.744265729 +0900
+@@ -875,6 +875,10 @@
+ 	atomic_inc(&(skb_shinfo(skb)->dataref));
+ 	skb->cloned = 1;
+ 
++#ifdef FLOW_TABLE
++	n->ft = NULL;
++#endif
++
+ 	return n;
+ #undef C
+ }
+diff -urN linux-4.19.127/net/ipv4/arp.c /mnt/firecracker/new_scone/net/ipv4/arp.c
+--- linux-4.19.127/net/ipv4/arp.c	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/ipv4/arp.c	2021-12-14 18:29:01.752265578 +0900
+@@ -185,6 +185,25 @@
+ };
+ EXPORT_SYMBOL(arp_tbl);
+ 
++#ifdef SIMPLE_PATH
++struct neighbour *__ipv4_neigh_lookup_noref_proxy(struct net_device *dev, u32 key)
++{
++	struct neigh_hash_table *nht = rcu_dereference_bh(arp_tbl.nht);
++	struct neighbour *n;
++	u32 hash_val;
++
++	hash_val = arp_hashfn(key, dev, nht->hash_rnd[0]) >> (32 - nht->hash_shift);
++	for (n = rcu_dereference_bh(nht->hash_buckets[hash_val]);
++	     n != NULL;
++	     n = rcu_dereference_bh(n->next)) {
++		if (n->dev == dev && *(u32 *)n->primary_key == key)
++			return n;
++	}
++
++	return NULL;
++}
++#endif
++
+ int arp_mc_map(__be32 addr, u8 *haddr, struct net_device *dev, int dir)
+ {
+ 	switch (dev->type) {
+diff -urN linux-4.19.127/net/ipv4/ip_forward.c /mnt/firecracker/new_scone/net/ipv4/ip_forward.c
+--- linux-4.19.127/net/ipv4/ip_forward.c	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/ipv4/ip_forward.c	2021-12-14 18:29:01.756265503 +0900
+@@ -83,6 +83,7 @@
+ 	struct rtable *rt;	/* Route we use */
+ 	struct ip_options *opt	= &(IPCB(skb)->opt);
+ 	struct net *net;
++        int rec;
+ 
+ 	/* that should never happen */
+ 	if (skb->pkt_type != PACKET_HOST)
+@@ -147,9 +148,7 @@
+ 	if (net->ipv4.sysctl_ip_fwd_update_priority)
+ 		skb->priority = rt_tos2priority(iph->tos);
+ 
+-	return NF_HOOK(NFPROTO_IPV4, NF_INET_FORWARD,
+-		       net, NULL, skb, skb->dev, rt->dst.dev,
+-		       ip_forward_finish);
++  return NF_HOOK(NFPROTO_IPV4, NF_INET_FORWARD, net, NULL, skb, skb->dev, rt->dst.dev, ip_forward_finish);
+ 
+ sr_failed:
+ 	/*
+diff -urN linux-4.19.127/net/ipv4/ip_input.c /mnt/firecracker/new_scone/net/ipv4/ip_input.c
+--- linux-4.19.127/net/ipv4/ip_input.c	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/ipv4/ip_input.c	2021-12-14 18:29:01.756265503 +0900
+@@ -331,16 +331,16 @@
+ 		}
+ 	}
+ 
+-	/*
+-	 *	Initialise the virtual path cache for the packet. It describes
+-	 *	how the packet travels inside Linux networking.
+-	 */
+-	if (!skb_valid_dst(skb)) {
+-		err = ip_route_input_noref(skb, iph->daddr, iph->saddr,
+-					   iph->tos, dev);
+-		if (unlikely(err))
+-			goto drop_error;
+-	}
++  if (!skb_valid_dst(skb)){
++		err = ip_route_input_noref(skb, iph->daddr, iph->saddr, iph->tos, dev);
++                if (unlikely(err))
++                        goto drop_error;
++
++#ifdef FLOW_TABLE
++//		if (skb->ft != NULL)
++//			skb->ft->_skb_refdst = skb->_skb_refdst;
++#endif
++      }
+ 
+ #ifdef CONFIG_IP_ROUTE_CLASSID
+ 	if (unlikely(skb_dst(skb)->tclassid)) {
+diff -urN linux-4.19.127/net/ipv4/ip_output.c /mnt/firecracker/new_scone/net/ipv4/ip_output.c
+--- linux-4.19.127/net/ipv4/ip_output.c	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/ipv4/ip_output.c	2022-01-03 15:33:05.449107228 +0900
+@@ -81,11 +81,14 @@
+ #include <linux/netlink.h>
+ #include <linux/tcp.h>
+ 
++#include <linux/scone.h>
++
++#ifndef FLOW_TABLE
+ static int
+ ip_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
+ 	    unsigned int mtu,
+ 	    int (*output)(struct net *, struct sock *, struct sk_buff *));
+-
++#endif
+ /* Generate a checksum for an outgoing IP datagram. */
+ void ip_send_check(struct iphdr *iph)
+ {
+@@ -180,8 +183,11 @@
+ 	return ip_local_out(net, skb->sk, skb);
+ }
+ EXPORT_SYMBOL_GPL(ip_build_and_send_pkt);
+-
++#ifdef FLOW_TABLE
++int ip_finish_output2(struct net *net, struct sock *sk, struct sk_buff *skb)
++#else
+ static int ip_finish_output2(struct net *net, struct sock *sk, struct sk_buff *skb)
++#endif
+ {
+ 	struct dst_entry *dst = skb_dst(skb);
+ 	struct rtable *rt = (struct rtable *)dst;
+@@ -219,16 +225,26 @@
+ 
+ 	rcu_read_lock_bh();
+ 	nexthop = (__force u32) rt_nexthop(rt, ip_hdr(skb)->daddr);
++
+ 	neigh = __ipv4_neigh_lookup_noref(dev, nexthop);
++
+ 	if (unlikely(!neigh))
+-		neigh = __neigh_create(&arp_tbl, &nexthop, dev, false);
++                neigh = __neigh_create(&arp_tbl, &nexthop, dev, false);
++
+ 	if (!IS_ERR(neigh)) {
+ 		int res;
+ 
+ 		sock_confirm_neigh(skb, neigh);
+ 		res = neigh_output(neigh, skb);
+-
+ 		rcu_read_unlock_bh();
++#ifdef SIMPLE_PATH
++		if(res == NET_XMIT_SUCCESS && skb->ft != NULL){
++			if(ip_hdr(skb)->daddr == 33619978){
++				skb->ft->xmit_simple = 1;
++				skb->ft->netfilter = 1;
++			}
++		}
++#endif
+ 		return res;
+ 	}
+ 	rcu_read_unlock_bh();
+@@ -402,10 +418,11 @@
+ 	skb->dev = dev;
+ 	skb->protocol = htons(ETH_P_IP);
+ 
+-	return NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING,
+-			    net, sk, skb, NULL, dev,
+-			    ip_finish_output,
+-			    !(IPCB(skb)->flags & IPSKB_REROUTED));
++  return NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING,
++                        net, sk, skb, NULL, dev,
++                        ip_finish_output,
++                        !(IPCB(skb)->flags & IPSKB_REROUTED));
++
+ }
+ 
+ /*
+@@ -539,10 +556,15 @@
+ #endif
+ 	skb_copy_secmark(to, from);
+ }
+-
++#ifndef FLOW_TABLE
+ static int ip_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
+ 		       unsigned int mtu,
+ 		       int (*output)(struct net *, struct sock *, struct sk_buff *))
++#else
++int ip_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
++                       unsigned int mtu,
++                       int (*output)(struct net *, struct sock *, struct sk_buff *))
++#endif
+ {
+ 	struct iphdr *iph = ip_hdr(skb);
+ 
+diff -urN linux-4.19.127/net/ipv4/tcp_ipv4.c /mnt/firecracker/new_scone/net/ipv4/tcp_ipv4.c
+--- linux-4.19.127/net/ipv4/tcp_ipv4.c	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/ipv4/tcp_ipv4.c	2021-12-14 18:29:01.764265353 +0900
+@@ -1719,6 +1719,7 @@
+ 
+ 	th = (const struct tcphdr *)skb->data;
+ 	iph = ip_hdr(skb);
++
+ lookup:
+ 	sk = __inet_lookup_skb(&tcp_hashinfo, skb, __tcp_hdrlen(th), th->source,
+ 			       th->dest, sdif, &refcounted);
+diff -urN linux-4.19.127/net/netfilter/Kconfig /mnt/firecracker/new_scone/net/netfilter/Kconfig
+--- linux-4.19.127/net/netfilter/Kconfig	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/netfilter/Kconfig	2021-12-14 18:29:01.796264753 +0900
+@@ -56,7 +56,7 @@
+ 
+ config NF_CONNTRACK
+ 	tristate "Netfilter connection tracking support"
+-	default m if NETFILTER_ADVANCED=n
++	default y if NETFILTER_ADVANCED=n
+ 	select NF_DEFRAG_IPV4
+ 	select NF_DEFRAG_IPV6 if IPV6 != n
+ 	help
+@@ -396,7 +396,9 @@
+ 	  the enqueued via NFNETLINK.
+ 
+ config NF_NAT
+-	tristate
++	tristate "Network Address Translation support"
++        depends on NF_CONNTRACK
++        default y if NETFILTER_ADVANCED=n
+ 
+ config NF_NAT_NEEDED
+ 	bool
+diff -urN linux-4.19.127/net/netfilter/nf_nat_core.c /mnt/firecracker/new_scone/net/netfilter/nf_nat_core.c
+--- linux-4.19.127/net/netfilter/nf_nat_core.c	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/netfilter/nf_nat_core.c	2021-12-14 18:29:01.804264602 +0900
+@@ -33,6 +33,45 @@
+ 
+ #include "nf_internals.h"
+ 
++#include <linux/scone.h>
++
++#if IS_ENABLED(CONFIG_NF_NAT)
++#ifdef FLOW_TABLE
++int scone_simple_netfilter(struct sk_buff *skb){
++    enum ip_conntrack_info ctinfo;
++    enum nf_nat_manip_type maniptype = NF_NAT_MANIP_SRC;
++    struct nf_conn *ct;
++    int hooknum, err = NF_ACCEPT;
++    struct iphdr *iph;
++
++    iph = ip_hdr(skb);
++
++    if(skb == NULL)
++        return NF_ACCEPT;
++
++    ct = nf_ct_get(skb, &ctinfo);
++    if (!ct)
++                return NF_ACCEPT;
++
++    if (maniptype == NF_NAT_MANIP_SRC)
++                hooknum = NF_INET_LOCAL_IN; /* Source NAT */
++    else
++                hooknum = NF_INET_LOCAL_OUT; /* Destination NAT */
++
++    if (!nf_nat_initialized(ct, maniptype)) {
++                err = nf_nat_alloc_null_binding(ct, hooknum);
++                if (err != NF_ACCEPT)
++                                return err;
++        }
++
++    err = nf_nat_packet(ct, ctinfo, hooknum, skb);
++
++    return err;
++}
++EXPORT_SYMBOL(scone_simple_netfilter);
++#endif
++#endif
++
+ static spinlock_t nf_nat_locks[CONNTRACK_LOCKS];
+ 
+ static DEFINE_MUTEX(nf_nat_proto_mutex);
+diff -urN linux-4.19.127/net/sched/sch_generic.c /mnt/firecracker/new_scone/net/sched/sch_generic.c
+--- linux-4.19.127/net/sched/sch_generic.c	2020-06-07 20:17:57.000000000 +0900
++++ /mnt/firecracker/new_scone/net/sched/sch_generic.c	2021-12-14 18:29:01.836264001 +0900
+@@ -436,6 +436,7 @@
+ 
+ static void dev_watchdog(struct timer_list *t)
+ {
++#ifndef SIMPLE_PATH
+ 	struct net_device *dev = from_timer(dev, t, watchdog_timer);
+ 
+ 	netif_tx_lock(dev);
+@@ -475,6 +476,7 @@
+ 	netif_tx_unlock(dev);
+ 
+ 	dev_put(dev);
++#endif
+ }
+ 
+ void __netdev_watchdog_up(struct net_device *dev)

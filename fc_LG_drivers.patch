@@ -1,0 +1,53 @@
+--- linux-4.19.127/drivers/net/tun.c	2020-06-07 20:17:57.000000000 +0900
++++ new_scone/drivers/net/tun.c	2021-12-30 15:10:35.224081360 +0900
+@@ -80,6 +80,8 @@
+ 
+ #include <linux/uaccess.h>
+ #include <linux/proc_fs.h>
++//kwlee
++#include <linux/scone.h>
+ 
+ static void tun_default_link_ksettings(struct net_device *dev,
+ 				       struct ethtool_link_ksettings *cmd);
+@@ -1528,6 +1530,17 @@
+ 	struct sk_buff_head process_queue;
+ 	u32 rx_batched = tun->rx_batched;
+ 	bool rcv = false;
++#ifdef FCRACKER
++	int err;
++	if(skb->ft != NULL && skb->ft->xmit_simple == 1){
++		err = netif_simple_path(skb);
++//		printk("FC_LG: [%s] netif simple path err = %d\n", __func__, err);
++		if (err == NET_RX_SUCCESS)
++			return;
++	}
++#endif
++	if(skb->ft != NULL)
++		printk("FC_LG: [%s] Normal path", __func__);
+ 
+ 	if (!rx_batched || (!more && skb_queue_empty(queue))) {
+ 		local_bh_disable();
+@@ -1888,6 +1901,10 @@
+ 	skb_reset_network_header(skb);
+ 	skb_probe_transport_header(skb, 0);
+ 
++	#ifdef FCRACKER
++		probe_ft(skb);
++	#endif
++
+ 	if (skb_xdp) {
+ 		struct bpf_prog *xdp_prog;
+ 		int ret;
+@@ -2635,7 +2652,11 @@
+ 			err = -ENOMEM;
+ 			goto err_free_dev;
+ 		}
+-
++#ifdef FCRACKER
++		tun->dev->ft = NULL;
++		INIT_LIST_HEAD(&tun->dev->ctable_list);
++		printk("FC_LG: [%s] device name=%s\n", __func__, tun->dev->name);
++#endif
+ 		spin_lock_init(&tun->lock);
+ 
+ 		err = security_tun_dev_alloc_security(&tun->security);
